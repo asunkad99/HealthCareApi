@@ -1,4 +1,4 @@
-const fetch = require('node-fetch');
+import fetch from 'node-fetch';
 
 const API_KEY = 'ak_3b1925b8197c03bf12cb20b102ea86ecded2fe064080c3ff';
 const BASE_URL = 'https://assessment.ksensetech.com/api';
