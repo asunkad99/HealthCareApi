@@ -3,126 +3,167 @@ import fetch from 'node-fetch';
 const API_KEY = 'ak_3b1925b8197c03bf12cb20b102ea86ecded2fe064080c3ff';
 const BASE_URL = 'https://assessment.ksensetech.com/api';
 
-async function fetchPatients(page = 1, limit = 20, allPatients = []) {
+async function fetchPatients(page = 1, limit = 20) {
   const url = `${BASE_URL}/patients?page=${page}&limit=${limit}`;
-  const res = await fetch(url, {
-    headers: { 'x-api-key': API_KEY }
-  });
-  if (res.status === 429) {
-    console.log('Rate limited, retrying after 1 second...');
-    await new Promise(r => setTimeout(r, 1000));
-    return fetchPatients(page, limit, allPatients);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'x-api-key': API_KEY,
+      },
+    });
+
+    if (!response.ok) {
+      console.error(`API error: ${response.status} ${response.statusText}`);
+      return null;
+    }
+
+    const json = await response.json();
+
+    // Debug log for API response structure
+    // console.log("API response:", json);
+
+    if (json.data && Array.isArray(json.data)) {
+      return {
+        patients: json.data,
+        pagination: json.pagination,
+      };
+    } else {
+      console.error('Unexpected API response format:', json);
+      return null;
+    }
+  } catch (error) {
+    console.error('Fetch error:', error);
+    return null;
   }
-  if (!res.ok) {
-    console.log(`Error fetching page ${page}: ${res.status}`);
-    await new Promise(r => setTimeout(r, 1000));
-    return fetchPatients(page, limit, allPatients);
-  }
-  const json = await res.json();
-  allPatients.push(...json.data);
-  if (json.pagination.hasNext) {
-    return fetchPatients(page + 1, limit, allPatients);
-  }
-  return allPatients;
 }
 
-function parseBloodPressure(bp) {
-  if (!bp || typeof bp !== 'string') return null;
-  const parts = bp.split('/');
+// Helper functions to parse risk scores from data
+function parseBloodPressure(bpString) {
+  if (!bpString || typeof bpString !== 'string') return null;
+  const parts = bpString.split('/');
   if (parts.length !== 2) return null;
+
   const systolic = parseInt(parts[0], 10);
   const diastolic = parseInt(parts[1], 10);
   if (isNaN(systolic) || isNaN(diastolic)) return null;
+
   return { systolic, diastolic };
 }
 
 function bloodPressureRisk(bp) {
-  const values = parseBloodPressure(bp);
-  if (!values) return 0;
-  const { systolic, diastolic } = values;
-  // Determine risk stage by highest category between systolic and diastolic
-  let systolicStage, diastolicStage;
+  if (!bp) return 0;
+  const { systolic, diastolic } = bp;
 
-  if (systolic < 120) systolicStage = 1;
-  else if (systolic >= 120 && systolic <= 129) systolicStage = 2;
-  else if (systolic >= 130 && systolic <= 139) systolicStage = 3;
-  else if (systolic >= 140) systolicStage = 4;
-  else systolicStage = 0;
+  // Check for invalid readings
+  if (systolic == null || diastolic == null) return 0;
 
-  if (diastolic < 80) diastolicStage = 1;
-  else if (diastolic >= 80 && diastolic <= 89) diastolicStage = 3;
-  else if (diastolic >= 90) diastolicStage = 4;
-  else diastolicStage = 0;
+  if (systolic < 120 && diastolic < 80) return 1; // Normal
+  if (systolic >= 120 && systolic <= 129 && diastolic < 80) return 2; // Elevated
+  if ((systolic >= 130 && systolic <= 139) || (diastolic >= 80 && diastolic <= 89))
+    return 3; // Stage 1
+  if (systolic >= 140 || diastolic >= 90) return 4; // Stage 2
 
-  return Math.max(systolicStage, diastolicStage);
+  return 0; // default fallback
 }
 
 function temperatureRisk(temp) {
-  const t = parseFloat(temp);
-  if (isNaN(t)) return 0;
-  if (t <= 99.5) return 0;
-  if (t >= 99.6 && t <= 100.9) return 1;
-  if (t >= 101) return 2;
+  if (temp == null || isNaN(temp)) return 0;
+  if (temp <= 99.5) return 0; // Normal
+  if (temp >= 99.6 && temp <= 100.9) return 1; // Low fever
+  if (temp >= 101) return 2; // High fever
   return 0;
 }
 
 function ageRisk(age) {
-  const a = parseInt(age, 10);
-  if (isNaN(a)) return 0;
-  if (a < 40) return 1;
-  if (a >= 40 && a <= 65) return 1;
-  if (a > 65) return 2;
+  if (age == null || isNaN(age)) return 0;
+  if (age < 40) return 1;
+  if (age <= 65) return 1;
+  if (age > 65) return 2;
   return 0;
 }
 
-function hasDataQualityIssue(patient) {
-  const bpValid = parseBloodPressure(patient.blood_pressure) !== null;
-  const tempValid = !isNaN(parseFloat(patient.temperature));
-  const ageValid = !isNaN(parseInt(patient.age, 10));
-  return !(bpValid && tempValid && ageValid);
-}
-
-async function submitAssessment(results) {
-  const url = `${BASE_URL}/submit-assessment`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': API_KEY
-    },
-    body: JSON.stringify(results)
-  });
-  return res.json();
+function isValidNumber(value) {
+  return value !== null && value !== undefined && !isNaN(value);
 }
 
 async function main() {
   console.log('Fetching patient data...');
-  const patients = await fetchPatients();
 
-  const highRisk = [];
-  const fever = [];
-  const dataIssues = [];
+  let allPatients = [];
+  let page = 1;
+  let totalPages = 1;
 
-  for (const patient of patients) {
-    const bpScore = bloodPressureRisk(patient.blood_pressure);
-    const tempScore = temperatureRisk(patient.temperature);
-    const ageScore = ageRisk(patient.age);
+  do {
+    const result = await fetchPatients(page, 20);
+    if (!result) {
+      console.error('Failed to fetch patients, stopping.');
+      break;
+    }
+    allPatients = allPatients.concat(result.patients);
+    totalPages = result.pagination.totalPages;
+    page++;
+  } while (page <= totalPages);
+
+  // Arrays to collect patient IDs for each alert category
+  const highRiskPatients = [];
+  const feverPatients = [];
+  const dataQualityIssues = [];
+
+  for (const patient of allPatients) {
+    const bp = parseBloodPressure(patient.blood_pressure);
+    const bpScore = bloodPressureRisk(bp);
+
+    const temp = isValidNumber(patient.temperature) ? Number(patient.temperature) : null;
+    const tempScore = temperatureRisk(temp);
+
+    const age = isValidNumber(patient.age) ? Number(patient.age) : null;
+    const ageScore = ageRisk(age);
+
     const totalRisk = bpScore + tempScore + ageScore;
 
-    if (totalRisk >= 4) highRisk.push(patient.patient_id);
-    if (!isNaN(parseFloat(patient.temperature)) && parseFloat(patient.temperature) >= 99.6) fever.push(patient.patient_id);
-    if (hasDataQualityIssue(patient)) dataIssues.push(patient.patient_id);
+    // Check data quality issues:
+    const hasBadBP = !bp;
+    const hasBadTemp = temp === null;
+    const hasBadAge = age === null;
+
+    if (hasBadBP || hasBadTemp || hasBadAge) {
+      dataQualityIssues.push(patient.patient_id);
+    }
+
+    if (totalRisk >= 4) {
+      highRiskPatients.push(patient.patient_id);
+    }
+
+    if (temp !== null && temp >= 99.6) {
+      feverPatients.push(patient.patient_id);
+    }
   }
 
+  // Prepare results for submission
   const results = {
-    high_risk_patients: highRisk,
-    fever_patients: fever,
-    data_quality_issues: dataIssues
+    high_risk_patients: [...new Set(highRiskPatients)],
+    fever_patients: [...new Set(feverPatients)],
+    data_quality_issues: [...new Set(dataQualityIssues)],
   };
 
-  console.log('Submitting results...');
-  const response = await submitAssessment(results);
-  console.log('Submission response:', response);
+  console.log('Submitting results to API...');
+  try {
+    const submitResponse = await fetch(`${BASE_URL}/submit-assessment`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY,
+      },
+      body: JSON.stringify(results),
+    });
+
+    const submitJson = await submitResponse.json();
+
+    console.log('Submission response:', submitJson);
+  } catch (err) {
+    console.error('Error submitting results:', err);
+  }
 }
 
-main().catch(console.error);
+main();
