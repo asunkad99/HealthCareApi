@@ -1,0 +1,166 @@
+import fetch from 'node-fetch';
+
+const API_KEY = 'ak_3b1925b8197c03bf12cb20b102ea86ecded2fe064080c3ff';
+const BASE_URL = 'https://assessment.ksensetech.com/api';
+const MAX_PAGES = 10;
+const PAGE_LIMIT = 5;
+
+async function fetchWithRetry(url, options = {}, retries = 5, backoff = 300) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 429 || res.status === 500 || res.status === 503) {
+        // Retry after delay
+        await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
+        continue;
+      }
+      if (!res.ok) {
+        throw new Error(`HTTP error! status: ${res.status}`);
+      }
+      return res.json();
+    } catch (e) {
+      if (attempt === retries - 1) throw e;
+      await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
+    }
+  }
+}
+
+function parseBloodPressure(bp) {
+  if (!bp || typeof bp !== 'string') return null;
+  const parts = bp.split('/');
+  if (parts.length !== 2) return null;
+  const sys = parseInt(parts[0], 10);
+  const dia = parseInt(parts[1], 10);
+  if (isNaN(sys) || isNaN(dia)) return null;
+  return { sys, dia };
+}
+
+function bloodPressureRisk({ sys, dia }) {
+  if (sys === null || dia === null) return 0;
+
+  function sysCategory(s) {
+    if (s < 120) return 1;
+    if (s >= 120 && s <= 129) return 2;
+    if (s >= 130 && s <= 139) return 3;
+    if (s >= 140) return 4;
+    return 0;
+  }
+  function diaCategory(d) {
+    if (d < 80) return 1;
+    if (d >= 80 && d <= 89) return 3;
+    if (d >= 90) return 4;
+    return 0;
+  }
+
+  const sCat = sysCategory(sys);
+  const dCat = diaCategory(dia);
+  return Math.max(sCat, dCat);
+}
+
+function parseTemperature(temp) {
+  if (temp === null || temp === undefined) return null;
+  if (typeof temp === 'number') return temp;
+  if (typeof temp === 'string') {
+    const val = parseFloat(temp);
+    if (isNaN(val)) return null;
+    return val;
+  }
+  return null;
+}
+
+function temperatureRisk(temp) {
+  if (temp === null) return 0;
+  if (temp <= 99.5) return 0;
+  if (temp >= 99.6 && temp <= 100.9) return 1;
+  if (temp >= 101) return 2;
+  return 0;
+}
+
+function parseAge(age) {
+  if (age === null || age === undefined) return null;
+  if (typeof age === 'number') return age;
+  if (typeof age === 'string') {
+    const val = parseInt(age, 10);
+    if (isNaN(val)) return null;
+    return val;
+  }
+  return null;
+}
+
+function ageRisk(age) {
+  if (age === null) return 0;
+  if (age < 40) return 1;
+  if (age >= 40 && age <= 65) return 1;
+  if (age > 65) return 2;
+  return 0;
+}
+
+async function main() {
+  const allPatients = [];
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const url = `${BASE_URL}/patients?page=${page}&limit=${PAGE_LIMIT}`;
+    const json = await fetchWithRetry(url, {
+      headers: { 'x-api-key': API_KEY }
+    });
+    if (!json.data || !Array.isArray(json.data)) break;
+    allPatients.push(...json.data);
+
+    if (!json.pagination || !json.pagination.hasNext) break;
+  }
+
+  const highRiskPatients = [];
+  const feverPatients = [];
+  const dataQualityIssues = [];
+
+  for (const patient of allPatients) {
+    const bp = parseBloodPressure(patient.blood_pressure);
+    const temp = parseTemperature(patient.temperature);
+    const age = parseAge(patient.age);
+
+    // Check data quality issues
+    let hasDataIssue = false;
+    if (!bp || bp.sys === null || bp.dia === null) hasDataIssue = true;
+    if (temp === null) hasDataIssue = true;
+    if (age === null) hasDataIssue = true;
+
+    if (hasDataIssue) dataQualityIssues.push(patient.patient_id);
+
+    const bpScore = bp ? bloodPressureRisk(bp) : 0;
+    const tempScore = temperatureRisk(temp);
+    const ageScore = ageRisk(age);
+
+    const totalRisk = bpScore + tempScore + ageScore;
+
+    if (totalRisk >= 4) highRiskPatients.push(patient.patient_id);
+    if (temp !== null && temp >= 99.6) feverPatients.push(patient.patient_id);
+  }
+
+  // Remove duplicates from lists
+  function unique(arr) {
+    return [...new Set(arr)];
+  }
+
+  const results = {
+    high_risk_patients: unique(highRiskPatients),
+    fever_patients: unique(feverPatients),
+    data_quality_issues: unique(dataQualityIssues),
+  };
+
+  console.log('Prepared Results:', results);
+
+  // Submit results
+  const submitResponse = await fetch(`${BASE_URL}/submit-assessment`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': API_KEY,
+    },
+    body: JSON.stringify(results),
+  });
+
+  const submitJson = await submitResponse.json();
+  console.log('Submission Response:', submitJson);
+}
+
+main().catch(console.error);
