@@ -1,166 +1,128 @@
-import fetch from 'node-fetch';
+const fetch = require('node-fetch');
 
 const API_KEY = 'ak_3b1925b8197c03bf12cb20b102ea86ecded2fe064080c3ff';
 const BASE_URL = 'https://assessment.ksensetech.com/api';
-const MAX_PAGES = 10;
-const PAGE_LIMIT = 5;
 
-async function fetchWithRetry(url, options = {}, retries = 5, backoff = 300) {
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const res = await fetch(url, options);
-      if (res.status === 429 || res.status === 500 || res.status === 503) {
-        // Retry after delay
-        await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
-        continue;
-      }
-      if (!res.ok) {
-        throw new Error(`HTTP error! status: ${res.status}`);
-      }
-      return res.json();
-    } catch (e) {
-      if (attempt === retries - 1) throw e;
-      await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
-    }
+async function fetchPatients(page = 1, limit = 20, allPatients = []) {
+  const url = `${BASE_URL}/patients?page=${page}&limit=${limit}`;
+  const res = await fetch(url, {
+    headers: { 'x-api-key': API_KEY }
+  });
+  if (res.status === 429) {
+    console.log('Rate limited, retrying after 1 second...');
+    await new Promise(r => setTimeout(r, 1000));
+    return fetchPatients(page, limit, allPatients);
   }
+  if (!res.ok) {
+    console.log(`Error fetching page ${page}: ${res.status}`);
+    await new Promise(r => setTimeout(r, 1000));
+    return fetchPatients(page, limit, allPatients);
+  }
+  const json = await res.json();
+  allPatients.push(...json.data);
+  if (json.pagination.hasNext) {
+    return fetchPatients(page + 1, limit, allPatients);
+  }
+  return allPatients;
 }
 
 function parseBloodPressure(bp) {
   if (!bp || typeof bp !== 'string') return null;
   const parts = bp.split('/');
   if (parts.length !== 2) return null;
-  const sys = parseInt(parts[0], 10);
-  const dia = parseInt(parts[1], 10);
-  if (isNaN(sys) || isNaN(dia)) return null;
-  return { sys, dia };
+  const systolic = parseInt(parts[0], 10);
+  const diastolic = parseInt(parts[1], 10);
+  if (isNaN(systolic) || isNaN(diastolic)) return null;
+  return { systolic, diastolic };
 }
 
-function bloodPressureRisk({ sys, dia }) {
-  if (sys === null || dia === null) return 0;
+function bloodPressureRisk(bp) {
+  const values = parseBloodPressure(bp);
+  if (!values) return 0;
+  const { systolic, diastolic } = values;
+  // Determine risk stage by highest category between systolic and diastolic
+  let systolicStage, diastolicStage;
 
-  function sysCategory(s) {
-    if (s < 120) return 1;
-    if (s >= 120 && s <= 129) return 2;
-    if (s >= 130 && s <= 139) return 3;
-    if (s >= 140) return 4;
-    return 0;
-  }
-  function diaCategory(d) {
-    if (d < 80) return 1;
-    if (d >= 80 && d <= 89) return 3;
-    if (d >= 90) return 4;
-    return 0;
-  }
+  if (systolic < 120) systolicStage = 1;
+  else if (systolic >= 120 && systolic <= 129) systolicStage = 2;
+  else if (systolic >= 130 && systolic <= 139) systolicStage = 3;
+  else if (systolic >= 140) systolicStage = 4;
+  else systolicStage = 0;
 
-  const sCat = sysCategory(sys);
-  const dCat = diaCategory(dia);
-  return Math.max(sCat, dCat);
-}
+  if (diastolic < 80) diastolicStage = 1;
+  else if (diastolic >= 80 && diastolic <= 89) diastolicStage = 3;
+  else if (diastolic >= 90) diastolicStage = 4;
+  else diastolicStage = 0;
 
-function parseTemperature(temp) {
-  if (temp === null || temp === undefined) return null;
-  if (typeof temp === 'number') return temp;
-  if (typeof temp === 'string') {
-    const val = parseFloat(temp);
-    if (isNaN(val)) return null;
-    return val;
-  }
-  return null;
+  return Math.max(systolicStage, diastolicStage);
 }
 
 function temperatureRisk(temp) {
-  if (temp === null) return 0;
-  if (temp <= 99.5) return 0;
-  if (temp >= 99.6 && temp <= 100.9) return 1;
-  if (temp >= 101) return 2;
+  const t = parseFloat(temp);
+  if (isNaN(t)) return 0;
+  if (t <= 99.5) return 0;
+  if (t >= 99.6 && t <= 100.9) return 1;
+  if (t >= 101) return 2;
   return 0;
-}
-
-function parseAge(age) {
-  if (age === null || age === undefined) return null;
-  if (typeof age === 'number') return age;
-  if (typeof age === 'string') {
-    const val = parseInt(age, 10);
-    if (isNaN(val)) return null;
-    return val;
-  }
-  return null;
 }
 
 function ageRisk(age) {
-  if (age === null) return 0;
-  if (age < 40) return 1;
-  if (age >= 40 && age <= 65) return 1;
-  if (age > 65) return 2;
+  const a = parseInt(age, 10);
+  if (isNaN(a)) return 0;
+  if (a < 40) return 1;
+  if (a >= 40 && a <= 65) return 1;
+  if (a > 65) return 2;
   return 0;
 }
 
-async function main() {
-  const allPatients = [];
+function hasDataQualityIssue(patient) {
+  const bpValid = parseBloodPressure(patient.blood_pressure) !== null;
+  const tempValid = !isNaN(parseFloat(patient.temperature));
+  const ageValid = !isNaN(parseInt(patient.age, 10));
+  return !(bpValid && tempValid && ageValid);
+}
 
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const url = `${BASE_URL}/patients?page=${page}&limit=${PAGE_LIMIT}`;
-    const json = await fetchWithRetry(url, {
-      headers: { 'x-api-key': API_KEY }
-    });
-    if (!json.data || !Array.isArray(json.data)) break;
-    allPatients.push(...json.data);
-
-    if (!json.pagination || !json.pagination.hasNext) break;
-  }
-
-  const highRiskPatients = [];
-  const feverPatients = [];
-  const dataQualityIssues = [];
-
-  for (const patient of allPatients) {
-    const bp = parseBloodPressure(patient.blood_pressure);
-    const temp = parseTemperature(patient.temperature);
-    const age = parseAge(patient.age);
-
-    // Check data quality issues
-    let hasDataIssue = false;
-    if (!bp || bp.sys === null || bp.dia === null) hasDataIssue = true;
-    if (temp === null) hasDataIssue = true;
-    if (age === null) hasDataIssue = true;
-
-    if (hasDataIssue) dataQualityIssues.push(patient.patient_id);
-
-    const bpScore = bp ? bloodPressureRisk(bp) : 0;
-    const tempScore = temperatureRisk(temp);
-    const ageScore = ageRisk(age);
-
-    const totalRisk = bpScore + tempScore + ageScore;
-
-    if (totalRisk >= 4) highRiskPatients.push(patient.patient_id);
-    if (temp !== null && temp >= 99.6) feverPatients.push(patient.patient_id);
-  }
-
-  // Remove duplicates from lists
-  function unique(arr) {
-    return [...new Set(arr)];
-  }
-
-  const results = {
-    high_risk_patients: unique(highRiskPatients),
-    fever_patients: unique(feverPatients),
-    data_quality_issues: unique(dataQualityIssues),
-  };
-
-  console.log('Prepared Results:', results);
-
-  // Submit results
-  const submitResponse = await fetch(`${BASE_URL}/submit-assessment`, {
+async function submitAssessment(results) {
+  const url = `${BASE_URL}/submit-assessment`;
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': API_KEY,
+      'x-api-key': API_KEY
     },
-    body: JSON.stringify(results),
+    body: JSON.stringify(results)
   });
+  return res.json();
+}
 
-  const submitJson = await submitResponse.json();
-  console.log('Submission Response:', submitJson);
+async function main() {
+  console.log('Fetching patient data...');
+  const patients = await fetchPatients();
+
+  const highRisk = [];
+  const fever = [];
+  const dataIssues = [];
+
+  for (const patient of patients) {
+    const bpScore = bloodPressureRisk(patient.blood_pressure);
+    const tempScore = temperatureRisk(patient.temperature);
+    const ageScore = ageRisk(patient.age);
+    const totalRisk = bpScore + tempScore + ageScore;
+
+    if (totalRisk >= 4) highRisk.push(patient.patient_id);
+    if (!isNaN(parseFloat(patient.temperature)) && parseFloat(patient.temperature) >= 99.6) fever.push(patient.patient_id);
+    if (hasDataQualityIssue(patient)) dataIssues.push(patient.patient_id);
+  }
+
+  const results = {
+    high_risk_patients: highRisk,
+    fever_patients: fever,
+    data_quality_issues: dataIssues
+  };
+
+  console.log('Submitting results...');
+  const response = await submitAssessment(results);
+  console.log('Submission response:', response);
 }
 
 main().catch(console.error);
